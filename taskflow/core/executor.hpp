@@ -1610,6 +1610,36 @@ inline void Executor::_exploit_task(Worker& w, Node*& t) {
 }
 
 // Function: _wait_for_task
+//
+// 等待任务到达的核心函数 - 使用两阶段提交协议（2PC）实现高效且安全的线程休眠
+//
+// 函数作用：
+//   当工作线程无任务可执行时，避免忙等待浪费 CPU，通过 2PC 协议安全地进入休眠状态
+//
+// 执行流程：
+//   1. 调用 _explore_task() 尝试窃取任务
+//   2. 如果窃取成功（t != nullptr），返回 true 继续执行
+//   3. 如果窃取失败（t == nullptr），进入 2PC 协议：
+//      a) prepare_wait() - 第一阶段：声明"我准备休眠"
+//      b) 检查三个关键条件，确保所有队列真的为空
+//      c) 如果发现任务或停止信号，cancel_wait() 并采取相应行动
+//      d) 如果确认无任务，commit_wait() 进入休眠
+//   4. 被唤醒后，跳转到 explore_task 重新开始窃取循环
+//
+// 为什么需要两阶段提交协议（2PC）？
+//   问题：如果线程在准备休眠时，其他线程刚好提交了新任务，可能导致：
+//     - 所有线程都休眠
+//     - 新任务无人执行
+//     - 系统死锁
+//
+//   解决方案：在 prepare_wait() 和 commit_wait() 之间再次检查所有队列
+//     - 如果有新任务到达，至少有一个线程会发现并取消休眠
+//     - 提交任务的线程会看到 waiter 状态并尝试唤醒休眠线程
+//     - 避免所有线程同时休眠导致的死锁
+//
+// 返回值：
+//   - true  : 继续工作循环（窃取到任务或被唤醒）
+//   - false : 工作线程应该退出（收到停止信号 w._done == true）
 inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
 
   explore_task:
@@ -1633,47 +1663,96 @@ inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
   // Entering the 2PC guard as all queues should be empty after many stealing attempts.
   _notifier.prepare_wait(w._waiter);
   
-  // Condition #1: buffers should be empty
+  // ============================================================================
+  // 检查条件 #1: 中心化缓冲区（_buffers）必须为空
+  // ============================================================================
+  // 为什么要检查 _buffers？
+  //   1. 外部线程提交的任务会放入 _buffers（主线程调用 run/async）
+  //   2. 工作线程队列溢出的任务也会放入 _buffers（_wsq 容量为 1024）
+  //
+  // 检查时机：在 prepare_wait() 之后
+  //   - 如果在 prepare_wait() 之前有任务到达，我们会在这里发现
+  //   - 如果在检查过程中有任务到达，提交任务的线程会看到 waiter 状态并唤醒我们
   for(size_t vtm=0; vtm<_buffers.size(); ++vtm) {
     if(!_buffers._buckets[vtm].queue.empty()) {
+      // 发现任务！取消休眠，重新开始窃取
       _notifier.cancel_wait(w._waiter);
       w._vtm = vtm + _workers.size();
       goto explore_task;
     }
   }
   
-  // Condition #2: worker queues should be empty
-  // Note: We need to use index-based looping to avoid data race with _spawan
-  // which initializes other worker data structure at the same time
+  // ============================================================================
+  // 检查条件 #2: 所有工作线程的队列（_wsq）必须为空
+  // ============================================================================
+  // 为什么要检查其他工作线程的队列？
+  //   1. 其他工作线程可能刚刚产生了新任务（执行 Subflow/Runtime 任务时）
+  //   2. 这些任务可以被窃取（Chase-Lev 队列支持并发访问）
+  //
+  // 为什么跳过自己的队列？
+  //   - 如果自己的队列不为空，在 _exploit_task() 阶段就已经处理了
+  //   - 到这里时，自己的队列一定是空的
+  //
+  // Note: 使用基于索引的循环避免与 _spawn() 的数据竞争
+  // _spawn() 可能在同时初始化其他工作线程的数据结构
+
+  // 检查 ID 小于当前线程的工作线程
   for(size_t vtm=0; vtm<w._id; ++vtm) {
     if(!_workers[vtm]._wsq.empty()) {
+      // 发现任务！取消休眠，重新开始窃取
       _notifier.cancel_wait(w._waiter);
       w._vtm = vtm;
       goto explore_task;
     }
   }
-  
+
+  // 跳过自己的队列（w._id）
   // due to the property of the work-stealing queue, we don't need to check
   // the queue of this worker
+
+  // 检查 ID 大于当前线程的工作线程
   for(size_t vtm=w._id+1; vtm<_workers.size(); vtm++) {
     if(!_workers[vtm]._wsq.empty()) {
+      // 发现任务！取消休眠，重新开始窃取
       _notifier.cancel_wait(w._waiter);
       w._vtm = vtm;
       goto explore_task;
     }
   }
   
-  // Condition #3: worker should be alive
+  // ============================================================================
+  // 检查条件 #3: 工作线程必须存活（未收到停止信号）
+  // ============================================================================
+  // 为什么要检查 _done？
+  //   1. 执行器正在关闭（用户调用 wait_for_all() 或析构 Executor）
+  //   2. 避免线程在关闭过程中进入休眠，导致无法正常退出
+  //   3. 检查时机：在所有队列检查之后，确保不会错过任何任务
 #if __cplusplus >= TF_CPP20
   if(w._done.test(std::memory_order_relaxed)) {
 #else
   if(w._done.load(std::memory_order_relaxed)) {
 #endif
+    // 收到停止信号，取消休眠并退出
     _notifier.cancel_wait(w._waiter);
     return false;
   }
-  
-  // Now I really need to relinquish myself to others.
+
+  // ============================================================================
+  // 阶段 4: 提交休眠（commit_wait）
+  // ============================================================================
+  // 所有检查都通过：
+  //   ✓ _buffers 为空
+  //   ✓ 所有工作线程的 _wsq 为空
+  //   ✓ 线程未收到停止信号
+  //
+  // 现在可以安全地进入休眠状态
+  // commit_wait() 会阻塞当前线程，直到被其他线程唤醒
+  //
+  // 唤醒条件：
+  //   - 其他线程提交了新任务，调用 notify_one() 或 notify_all()
+  //   - 执行器关闭，调用 notify_all()
+  //
+  // 被唤醒后，跳转到 explore_task 重新开始窃取循环
   _notifier.commit_wait(w._waiter);
   goto explore_task;
 }
