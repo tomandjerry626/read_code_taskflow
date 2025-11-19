@@ -37,7 +37,7 @@ option(TF_BUILD_BENCHMARKS "Enables builds of benchmarks" OFF)
 option(TF_BUILD_PROFILER "Enables builds of profiler" OFF)
 option(TF_BUILD_CUDA "Enables builds of cuda code" OFF)
 #option(TF_BUILD_SYCL "Enables builds of sycl code" OFF)
-option(TF_BUILD_TESTS "Enables builds of tests" ON)
+option(TF_BUILD_TESTS "Enables builds of tests" OFF)
 option(TF_BUILD_EXAMPLES "Enables builds of examples" ON)
 
 # project-specific variables

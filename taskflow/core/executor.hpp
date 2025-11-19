@@ -1066,94 +1066,231 @@ class Executor {
   auto dependent_async(P&& params, F&& func, I first, I last);
 
   private:
-    
+
+  // 保护 _taskflows 列表的互斥锁
+  // 用于在多线程环境下安全地添加或移除由执行器管理的 taskflow 对象
   std::mutex _taskflows_mutex;
-  
+
+  // 工作线程池，存储所有工作线程对象
+  // 每个工作线程在执行器构造时创建，并在析构时销毁
+  // 工作线程数量在构造时确定，运行期间保持不变
   std::vector<Worker> _workers;
+
+  // 通知器对象，用于实现高效的线程唤醒机制
+  // 当有新任务到达时，通过通知器唤醒休眠的工作线程
+  // 支持 notify_one、notify_all 和 notify_n 等操作
+  // 根据编译选项和 C++ 版本选择不同的实现（AtomicNotifier 或 NonblockingNotifier）
   DefaultNotifier _notifier;
 
 #if __cplusplus >= TF_CPP20
+  // 当前正在运行的拓扑（topology）数量（C++20 版本使用原子变量）
+  // 拓扑表示一个 taskflow 的运行时实例，包含执行状态和元数据
+  // 用于 wait_for_all() 等待所有提交的任务完成
   std::atomic<size_t> _num_topologies {0};
 #else
+  // 条件变量，用于在拓扑计数变化时通知等待的线程（C++17 版本）
   std::condition_variable _topology_cv;
+
+  // 保护 _num_topologies 的互斥锁（C++17 版本）
   std::mutex _topology_mutex;
+
+  // 当前正在运行的拓扑（topology）数量（C++17 版本使用普通变量 + 锁）
   size_t _num_topologies {0};
 #endif
-  
+
+  // 由执行器管理的 taskflow 对象列表
+  // 当使用 run(std::move(taskflow)) 提交 taskflow 时，执行器会接管其生命周期
+  // 这些 taskflow 在执行完成后会被自动清理
   std::list<Taskflow> _taskflows;
 
+  // 中心化任务缓冲区（Freelist），用于存储待执行的任务节点
+  // 当工作线程的本地队列满时，任务会溢出到这个中心化缓冲区
+  // 当外部线程（非工作线程）提交任务时，任务也会放入这个缓冲区
+  // 使用多个桶（bucket）来减少竞争，桶的数量为 floor(log2(N))
   Freelist<Node*> _buffers;
 
+  // 用户自定义的工作线程接口，用于配置工作线程的行为
+  // 可以在工作线程进入/退出调度循环时执行自定义操作（如设置线程亲和性）
   std::shared_ptr<WorkerInterface> _worker_interface;
+
+  // 观察者集合，用于监控任务执行过程
+  // 观察者可以在任务执行前后收到通知，用于性能分析、日志记录等
   std::unordered_set<std::shared_ptr<ObserverInterface>> _observers;
+
+  // 线程 ID 到工作线程对象的映射表
+  // 用于快速查找当前线程对应的工作线程对象
+  // 在 this_worker() 和 this_worker_id() 等方法中使用
   std::unordered_map<std::thread::id, Worker*> _t2w;
 
+  // 关闭执行器，等待所有任务完成并停止所有工作线程
   void _shutdown();
+
+  // 在任务执行前调用所有观察者的 on_entry 回调
   void _observer_prologue(Worker&, Node*);
+
+  // 在任务执行后调用所有观察者的 on_exit 回调
   void _observer_epilogue(Worker&, Node*);
+
+  // 创建指定数量的工作线程并启动它们
   void _spawn(size_t);
+
+  // 利用阶段（Exploit）：工作线程持续从自己的本地队列中取出并执行任务
+  // 这是工作窃取算法的第一阶段，优先执行本地任务以提高缓存局部性
   void _exploit_task(Worker&, Node*&);
+
+  // 探索阶段（Explore）：当本地队列为空时，尝试从其他工作线程的队列中窃取任务
+  // 这是工作窃取算法的第二阶段，实现负载均衡
+  // 返回 false 表示工作线程应该退出（收到停止信号）
   bool _explore_task(Worker&, Node*&);
+
+  // 调度单个任务节点（从工作线程调用）
+  // 如果调用者是本执行器的工作线程，任务会被放入其本地队列；否则放入中心化缓冲区
   void _schedule(Worker&, Node*);
+
+  // 调度单个任务节点（从外部线程调用）
+  // 任务会被直接放入中心化缓冲区
   void _schedule(Node*);
+
+  // 设置拓扑（topology）以准备执行
+  // 初始化任务图中所有节点的运行时状态，并调度源节点（无前驱的节点）
   void _set_up_topology(Worker*, Topology*);
+
+  // 拆除拓扑（topology）
+  // 当拓扑中的所有任务执行完成时调用，清理资源并触发回调
   void _tear_down_topology(Worker&, Topology*);
+
+  // 拆除异步任务节点
   void _tear_down_async(Worker&, Node*, Node*&);
+
+  // 拆除依赖异步任务节点
   void _tear_down_dependent_async(Worker&, Node*, Node*&);
+
+  // 拆除非异步任务节点（普通任务）
+  // 递减父节点或拓扑的 join counter，当计数归零时触发后续操作
   void _tear_down_nonasync(Worker&, Node*, Node*&);
+
+  // 拆除调用节点的通用逻辑
   void _tear_down_invoke(Worker&, Node*, Node*&);
+
+  // 原子地增加正在运行的拓扑计数
   void _increment_topology();
+
+  // 原子地减少正在运行的拓扑计数，并在计数归零时通知等待的线程
   void _decrement_topology();
+
+  // 调用（执行）任务节点
+  // 这是任务执行的核心入口，根据任务类型分发到不同的 _invoke_* 方法
   void _invoke(Worker&, Node*);
+
+  // 调用静态任务（Static Task）
   void _invoke_static_task(Worker&, Node*);
+
+  // 调用非抢占式运行时任务
   void _invoke_nonpreemptive_runtime_task(Worker&, Node*);
+
+  // 调用条件任务（Condition Task），返回单个整数表示后继分支
   void _invoke_condition_task(Worker&, Node*, SmallVector<int>&);
+
+  // 调用多条件任务（Multi-Condition Task），返回多个整数表示多个后继分支
   void _invoke_multi_condition_task(Worker&, Node*, SmallVector<int>&);
+
+  // 处理依赖异步任务的依赖关系
   void _process_dependent_async(Node*, tf::AsyncTask&, size_t&);
+
+  // 处理任务执行过程中抛出的异常
   void _process_exception(Worker&, Node*);
+
+  // 调度异步任务
   void _schedule_async_task(Node*);
+
+  // 更新任务缓存，用于优化任务调度
+  // 将当前缓存的任务调度出去，并将新任务设置为缓存
   void _update_cache(Worker&, Node*&, Node*);
 
+  // 等待任务到达
+  // 当工作线程无任务可执行时，进入等待状态（使用两阶段提交协议）
+  // 返回 false 表示工作线程应该退出
   bool _wait_for_task(Worker&, Node*&);
+
+  // 调用子流任务（Subflow Task）
+  // 返回 true 表示任务被抢占，需要稍后继续执行
   bool _invoke_subflow_task(Worker&, Node*);
+
+  // 调用模块任务（Module Task）
+  // 返回 true 表示任务被抢占
   bool _invoke_module_task(Worker&, Node*);
+
+  // 调用模块任务的实现
   bool _invoke_module_task_impl(Worker&, Node*, Graph&);
+
+  // 调用异步任务
   bool _invoke_async_task(Worker&, Node*);
+
+  // 调用依赖异步任务
   bool _invoke_dependent_async_task(Worker&, Node*);
+
+  // 调用运行时任务（Runtime Task）
   bool _invoke_runtime_task(Worker&, Node*);
+
+  // 调用运行时任务的实现（单参数版本）
   bool _invoke_runtime_task_impl(Worker&, Node*, std::function<void(Runtime&)>&);
+
+  // 调用运行时任务的实现（双参数版本，第二个参数表示是否被抢占）
   bool _invoke_runtime_task_impl(Worker&, Node*, std::function<void(Runtime&, bool)>&);
 
+  // 设置任务图（Graph）以准备执行
+  // 遍历图中的节点，初始化运行时状态，并返回可以立即执行的节点迭代器
+  // 参数：[begin, end) 节点范围，拓扑对象，父节点
   template <typename I>
   I _set_up_graph(I, I, Topology*, Node*);
-  
+
+  // 协作运行直到满足停止条件
+  // 工作线程继续参与工作窃取循环，直到谓词返回 true
+  // 用于实现 corun_until 功能，避免阻塞工作线程
   template <typename P>
   void _corun_until(Worker&, P&&);
-  
+
+  // 协作运行任务图
+  // 工作线程协作执行指定范围内的任务节点
   template <typename I>
   void _corun_graph(Worker&, Node*, I, I);
 
+  // 调度一批任务节点（从工作线程调用）
+  // 将 [begin, end) 范围内的任务节点加入调度队列
   template <typename I>
   void _schedule(Worker&, I, I);
 
+  // 调度一批任务节点（从外部线程调用）
+  // 将 [begin, end) 范围内的任务节点加入中心化缓冲区
   template <typename I>
   void _schedule(I, I);
 
+  // 调度带有父节点的任务图
+  // 用于子流（Subflow）场景，将子任务关联到父任务
   template <typename I>
   void _schedule_graph_with_parent(Worker&, I, I, Node*);
 
+  // 创建异步任务的内部实现
+  // 返回 std::future 对象用于获取任务执行结果
   template <typename P, typename F>
   auto _async(P&&, F&&, Topology*, Node*);
 
+  // 创建静默异步任务的内部实现
+  // 不返回 std::future，性能更高
   template <typename P, typename F>
   void _silent_async(P&&, F&&, Topology*, Node*);
 
+  // 创建依赖异步任务的内部实现
+  // 任务在指定的前驱任务完成后才会执行
+  // 返回 AsyncTask 句柄和 std::future 对象
   template <typename P, typename F, typename I,
     std::enable_if_t<is_task_params_v<P> && !std::is_same_v<std::decay_t<I>, AsyncTask>, void>* = nullptr
   >
   auto _dependent_async(P&&, F&&, I, I, Topology*, Node*);
-  
-  template <typename P, typename F, typename I, 
+
+  // 创建静默依赖异步任务的内部实现
+  // 任务在指定的前驱任务完成后才会执行，但不返回 std::future
+  template <typename P, typename F, typename I,
     std::enable_if_t<is_task_params_v<P> && !std::is_same_v<std::decay_t<I>, AsyncTask>, void>* = nullptr
   >
   auto _silent_dependent_async(P&&, F&&, I, I, Topology*, Node*);
@@ -1376,50 +1513,91 @@ void Executor::_corun_until(Worker& w, P&& stop_predicate) {
 }
 
 // Function: _explore_task
+// 探索阶段（Explore）：工作窃取算法的核心函数
+// 当工作线程的本地队列为空时，尝试从其他线程的队列或中心化缓冲区中窃取任务
+// 参数：
+//   w - 当前工作线程对象
+//   t - 输出参数，窃取到的任务节点指针（如果窃取成功）
+// 返回值：
+//   true  - 窃取过程正常结束（可能窃取到任务，也可能没有）
+//   false - 工作线程收到停止信号，应该退出
 inline bool Executor::_explore_task(Worker& w, Node*& t) {
 
   //assert(!t);
-  
+
+  // 计算最大窃取尝试次数
+  // num_queues() = _workers.size() + _buffers.size()（工作线程数 + 缓冲区桶数）
+  // 公式：MAX_STEALS = (N + 1) * 2，其中 N 是总队列数
+  // 这个值确保每个队列至少被尝试窃取 2 次
   const size_t MAX_STEALS = ((num_queues() + 1) << 1);
+
+  // 创建均匀分布的随机数生成器，范围是 [0, num_queues()-1]
+  // 用于随机选择下一个受害者队列
   std::uniform_int_distribution<size_t> udist(0, num_queues()-1);
 
+  // 记录当前已经尝试窃取的次数（包括失败的尝试）
   size_t num_steals = 0;
+
+  // 获取当前工作线程的受害者索引（victim thread index）
+  // 这是上一次窃取时使用的受害者索引，优先从这个索引继续窃取
   size_t vtm = w._vtm;
 
+  // 窃取循环：持续尝试从不同的队列中窃取任务
   // Make the worker steal immediately from the assigned victim.
   while(true) {
-    
+
+    // 【核心窃取逻辑】根据受害者索引决定从哪里窃取任务
+    //
+    // 队列索引布局：
+    //   [0, _workers.size()-1]           -> 工作线程的本地队列
+    //   [_workers.size(), num_queues()-1] -> 中心化缓冲区的桶
+    //
     // If the worker's victim thread is within the worker pool, steal from the worker's queue.
     // Otherwise, steal from the buffer, adjusting the victim index based on the worker pool size.
     t = (vtm < _workers.size())
-      ? _workers[vtm]._wsq.steal()
-      : _buffers.steal(vtm - _workers.size());
+      ? _workers[vtm]._wsq.steal()                    // 从其他工作线程的队列顶部窃取
+      : _buffers.steal(vtm - _workers.size());        // 从中心化缓冲区的某个桶中窃取
 
+    // 窃取成功！
     if(t) {
+      // 更新工作线程的受害者索引，下次优先从这个索引继续窃取
+      // （因为这个队列可能还有更多任务）
       w._vtm = vtm;
-      break;
+      break;  // 跳出循环，返回窃取到的任务
     }
 
+    // 窃取失败（队列为空），增加失败计数
     // Increment the steal count, and if it exceeds MAX_STEALS, yield the thread.
     // If the number of empty steals reaches MAX_STEALS, exit the loop.
     if (++num_steals > MAX_STEALS) {
+      // 已经尝试了足够多次，主动让出 CPU 时间片
+      // 避免在所有队列都为空时过度消耗 CPU
       std::this_thread::yield();
+
+      // 如果窃取失败次数超过 150 + MAX_STEALS，彻底放弃
+      // 这表示系统中很可能没有任务了，准备进入休眠状态
       if(num_steals > 150 + MAX_STEALS) {
-        break;
+        break;  // 跳出循环，t 仍然是 nullptr
       }
     }
 
+    // 检查工作线程是否收到停止信号
   #if __cplusplus >= TF_CPP20
     if(w._done.test(std::memory_order_relaxed)) {
   #else
     if(w._done.load(std::memory_order_relaxed)) {
   #endif
-      return false;
-    } 
+      return false;  // 返回 false 表示线程应该退出
+    }
 
+    // 随机选择下一个受害者索引
+    // 使用工作线程自己的随机数生成器，避免多线程竞争
     // Randomely generate a next victim.
     vtm = udist(w._rdgen); //w._rdvtm();
-  } 
+  }
+
+  // 返回 true 表示窃取过程正常结束
+  // 注意：此时 t 可能是 nullptr（没有窃取到任务）或有效指针（窃取成功）
   return true;
 }
 
@@ -1436,15 +1614,22 @@ inline bool Executor::_wait_for_task(Worker& w, Node*& t) {
 
   explore_task:
 
-  if(_explore_task(w, t) == false) {
+  // 1. 进入窃取模式：线程 A 首先将自己的角色转变为“窃取者”（thief），并调用 explore_task 尝试从其他线程的队列以及共享队列中窃取任务
+  if(_explore_task(w, t) == false) { // 返回false是线程收到停止信号，跳出循环的标志.不是窃取失败的标志，窃取成功或者失败都会返回true.
     return false;
   }
   
   // Go exploit the task if we successfully steal one.
+  /*
+  窃取成功（简单情况）：如果 explore_task 成功找到了一个任务，线程 A 就重新变回“活跃的”（active）工作线程，并开始执行这个任务。
+  段落中还补充了一个关键细节：如果线程 A 之前是系统里最后一个窃取者，那么它在转为活跃状态后，必须负责唤醒另一个休眠的线程来接替它“窃取者”的角色。这确保了只要系统里有活跃的线程，就至少会有一个线程在不断地寻找新任务，从而保持系统的响应性。
+  */
   if(t) {
+    // 窃取成功，返回true到'_exploit_task'中执行.
     return true;
   }
 
+  // 窃取失败，当前线程要进入2PC等待模式.
   // Entering the 2PC guard as all queues should be empty after many stealing attempts.
   _notifier.prepare_wait(w._waiter);
   
@@ -1530,24 +1715,50 @@ inline size_t Executor::num_observers() const noexcept {
 }
 
 // Procedure: _schedule
+// 调度单个任务节点（从工作线程调用）
+// 这是任务调度的核心函数，决定任务应该放入本地队列还是中心化缓冲区
+// 参数：
+//   worker - 调用者的工作线程对象
+//   node   - 要调度的任务节点
 inline void Executor::_schedule(Worker& worker, Node* node) {
-  
+
+  // 【关键判断】检查调用者是否是本执行器的工作线程
   // caller is a worker of this executor - starting at v3.5 we do not use
   // any complicated notification mechanism as the experimental result
   // has shown no significant advantage.
   if(worker._executor == this) {
+    // 情况 1：调用者是本执行器的工作线程
+    // 优先放入工作线程的本地队列（_wsq），这是快速路径（Fast Path）
+    //
+    // worker._wsq.push() 的第二个参数是溢出回调（on_full callback）
+    // 当本地队列满时（容量 1024），会自动调用这个 lambda，将任务放入 _buffers
     worker._wsq.push(node, [&](){ _buffers.push(node); });
+    //                     ↑
+    //                     溢出回调：_wsq 满时自动调用
+
+    // 唤醒一个休眠的工作线程来执行任务
     _notifier.notify_one();
     return;
   }
-  
+
+  // 情况 2：调用者不是本执行器的工作线程（外部线程或其他执行器的线程）
+  // 直接放入中心化缓冲区，这是慢速路径（Slow Path）
   // caller is not a worker of this executor - go through the centralized queue
   _buffers.push(node);
   _notifier.notify_one();
 }
 
 // Procedure: _schedule
+// 调度单个任务节点（从外部线程调用）
+// 这个重载版本没有 Worker 参数，表示调用者一定不是工作线程
+// 参数：
+//   node - 要调度的任务节点
 inline void Executor::_schedule(Node* node) {
+  // 直接放入中心化缓冲区
+  // 使用场景：
+  //   1. 用户主线程调用 executor.run(taskflow)
+  //   2. 外部线程调用 executor.async()
+  //   3. 其他非工作线程提交任务
   _buffers.push(node);
   _notifier.notify_one();
 }

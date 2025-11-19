@@ -1,42 +1,42 @@
 list(APPEND TF_EXAMPLES
   simple 
-  attach_data
-  async
-  async_module
-  runtime_async
-  dependent_async
-  observer 
-  subflow 
-  fibonacci 
-  condition
-  multi_condition
-  switch_case
-  do_while_loop
-  while_loop
-  if_else
-  nested_if_else
-  visualization 
-  parallel_for 
-  parallel_sort
-  parallel_reduce 
-  inclusive_scan
-  exclusive_scan
-  pipeline
-  scalable_pipeline
-  text_pipeline
-  taskflow_pipeline
-  parallel_graph_pipeline
-  parallel_data_pipeline
-  run 
-  corun
-  runtime
-  composition
-  limited_concurrency
-  cancel
-  exception
-  subflow_exception
-  worker_interface
-  task_visitor
+  # attach_data
+  # async
+  # async_module
+  # runtime_async
+  # dependent_async
+  # observer 
+  # subflow 
+  # fibonacci 
+  # condition
+  # multi_condition
+  # switch_case
+  # do_while_loop
+  # while_loop
+  # if_else
+  # nested_if_else
+  # visualization 
+  # parallel_for 
+  # parallel_sort
+  # parallel_reduce 
+  # inclusive_scan
+  # exclusive_scan
+  # pipeline
+  # scalable_pipeline
+  # text_pipeline
+  # taskflow_pipeline
+  # parallel_graph_pipeline
+  # parallel_data_pipeline
+  # run 
+  # corun
+  # runtime
+  # composition
+  # limited_concurrency
+  # cancel
+  # exception
+  # subflow_exception
+  # worker_interface
+  # task_visitor
 )
 
 foreach(example IN LISTS TF_EXAMPLES)

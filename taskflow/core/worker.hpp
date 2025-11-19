@@ -88,21 +88,48 @@ class Worker {
     std::thread& thread() { return _thread; }
 
   private:
-  
+
   #if __cplusplus >= TF_CPP20
-    std::atomic_flag _done = ATOMIC_FLAG_INIT; 
+    // 工作线程的停止标志（C++20 使用 atomic_flag）
+    // 当设置为 true 时，表示该工作线程应该退出工作窃取循环
+    std::atomic_flag _done = ATOMIC_FLAG_INIT;
   #else
+    // 工作线程的停止标志（C++17 使用 atomic<bool>）
+    // 当设置为 true 时，表示该工作线程应该退出工作窃取循环
     std::atomic<bool> _done {false};
   #endif
 
+    // 工作线程的唯一标识符，范围为 [0, N-1]，其中 N 是执行器中的工作线程总数
+    // 用于标识工作线程在线程池中的位置
     size_t _id;
+
+    // 受害者线程索引（victim thread index）
+    // 在工作窃取算法中，当前工作线程尝试从该索引对应的队列中窃取任务
+    // 该值会被随机更新以实现负载均衡
     size_t _vtm;
+
+    // 指向该工作线程所属的执行器对象的指针
+    // 用于访问执行器的共享资源（如中心化缓冲区、通知器等）
     Executor* _executor {nullptr};
+
+    // 指向该工作线程对应的等待器对象的指针
+    // 等待器用于实现高效的线程休眠和唤醒机制（两阶段提交协议）
+    // 当工作线程无任务可执行时，通过等待器进入休眠状态
     DefaultNotifier::Waiter* _waiter;
+
+    // 该工作线程对应的底层操作系统线程对象
+    // 在执行器构造时创建，在执行器析构时 join
     std::thread _thread;
-    
+
+    // 随机数生成器，用于工作窃取算法中随机选择受害者线程
+    // 每个工作线程维护独立的随机数生成器以避免竞争
+    // 在线程启动时使用线程 ID 作为种子进行初始化
     std::default_random_engine _rdgen;
 
+    // 工作窃取队列（Work-Stealing Queue）
+    // 这是一个有界的双端队列，支持所有者线程从底部 push/pop，其他线程从顶部 steal
+    // 实现了 Chase-Lev 工作窃取算法，保证无锁的并发访问
+    // 队列中存储的是指向任务节点（Node*）的指针
     BoundedTaskQueue<Node*> _wsq;
 };
 
