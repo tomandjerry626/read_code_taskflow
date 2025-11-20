@@ -343,15 +343,58 @@ class Node {
     DependentAsync        // dependent async tasking
   >;
 
-  // 信号量集合
-  // 用于任务间的同步和资源管理
+  // ============================================================================
+  // 信号量集合（Semaphores）
+  // ============================================================================
+  // 用于任务间的同步和资源管理，限制并发执行的任务数量
+  //
+  // 使用场景：
+  //   1. 限制并发访问共享资源（例如：数据库连接池）
+  //   2. 控制任务的并发度（例如：最多 3 个任务同时执行）
+  //   3. 实现任务间的互斥（信号量值为 1）
+  //   4. 跨多个 Taskflow 的并发控制
+  //
+  // 示例：
+  //   tf::Semaphore semaphore(2);  // 最多 2 个任务同时执行
+  //   task.acquire(semaphore);     // 任务执行前获取信号量
+  //   task.release(semaphore);     // 任务执行后释放信号量
   struct Semaphores {
     // 任务执行前需要获取的信号量列表
-    // 如果无法获取所有信号量，任务会等待
+    //
+    // 作用：
+    //   - 在任务执行前（_invoke 的阶段 1.3），尝试获取所有信号量
+    //   - 如果无法获取所有信号量，任务会被放入信号量的等待队列
+    //   - 当其他任务释放信号量时，等待的任务会被重新调度
+    //
+    // 获取逻辑（见 Node::_acquire_all）：
+    //   - 按顺序尝试获取每个信号量
+    //   - 如果某个信号量获取失败，回滚已获取的信号量
+    //   - 将当前任务加入信号量的等待队列
+    //   - 返回 false，任务不执行，等待被唤醒
+    //
+    // 为什么可以有多个信号量？
+    //   - 任务可能需要多个资源（例如：数据库连接 + 文件句柄）
+    //   - 必须同时获取所有信号量，避免死锁
     SmallVector<Semaphore*> to_acquire;
 
     // 任务执行后需要释放的信号量列表
-    // 释放信号量可能会唤醒其他等待的任务
+    //
+    // 作用：
+    //   - 在任务执行后（_invoke 的阶段 3），释放所有信号量
+    //   - 释放信号量会增加信号量的计数
+    //   - 唤醒等待该信号量的任务，将它们重新调度
+    //
+    // 释放逻辑（见 Node::_release_all）：
+    //   - 遍历所有需要释放的信号量
+    //   - 调用 Semaphore::_release，增加计数
+    //   - 获取等待队列中的任务列表
+    //   - 调度这些任务（通过 _schedule）
+    //
+    // 为什么 acquire 和 release 可以不同？
+    //   - 任务可以只获取信号量（acquire only）
+    //   - 任务可以只释放信号量（release only）
+    //   - 任务可以同时获取和释放（acquire + release）
+    //   - 这提供了更灵活的同步模式
     SmallVector<Semaphore*> to_release;
   };
 
@@ -489,11 +532,143 @@ class Node {
   //   - DependentAsync       : 依赖异步任务
   handle_t _handle;
 
-  // 信号量指针，用于任务间的同步
+  // ============================================================================
+  // _semaphores：信号量指针，用于任务间的同步和并发控制
+  // ============================================================================
+  // 类型：std::unique_ptr<Semaphores>
+  //
+  // 作用：
+  //   限制任务的并发执行数量，实现资源管理和互斥
+  //
   // 包含两个列表：
-  //   - to_acquire : 任务执行前需要获取的信号量
-  //   - to_release : 任务执行后需要释放的信号量
-  // 使用 unique_ptr 是因为大多数任务不需要信号量，节省内存
+  //   - to_acquire : 任务执行前需要获取的信号量列表
+  //   - to_release : 任务执行后需要释放的信号量列表
+  //
+  // 为什么使用 unique_ptr？
+  //   - 大多数任务不需要信号量（常见情况）
+  //   - 使用 unique_ptr 可以节省内存（避免每个 Node 都分配 Semaphores）
+  //   - 只有调用 task.acquire() 或 task.release() 时才会分配
+  //
+  // 何时被赋值？
+  //   当用户调用以下 API 时，_semaphores 会被创建和赋值：
+  //
+  //   1. task.acquire(semaphore)
+  //      - 在 Task::acquire() 中创建 _semaphores（如果为空）
+  //      - 将 semaphore 添加到 to_acquire 列表
+  //      - 见 taskflow/core/task.hpp:982-988
+  //
+  //   2. task.release(semaphore)
+  //      - 在 Task::release() 中创建 _semaphores（如果为空）
+  //      - 将 semaphore 添加到 to_release 列表
+  //      - 见 taskflow/core/task.hpp:1006-1012
+  //
+  // 何时被使用？
+  //   在任务执行过程中（_invoke 函数），_semaphores 在两个阶段被使用：
+  //
+  //   【阶段 1.3】获取信号量（任务执行前）
+  //   ├─ 位置：executor.hpp:2052-2062
+  //   ├─ 检查：if(node->_semaphores && !node->_semaphores->to_acquire.empty())
+  //   ├─ 操作：调用 node->_acquire_all(waiters)
+  //   │  └─ 尝试获取 to_acquire 列表中的所有信号量
+  //   │  └─ 如果成功，继续执行任务
+  //   │  └─ 如果失败，任务被放入信号量的等待队列，返回等待
+  //   └─ 见 graph.hpp:823-836 (Node::_acquire_all)
+  //
+  //   【阶段 3】释放信号量（任务执行后）
+  //   ├─ 位置：executor.hpp:2264-2270
+  //   ├─ 检查：if(node->_semaphores && !node->_semaphores->to_release.empty())
+  //   ├─ 操作：调用 node->_release_all(waiters)
+  //   │  └─ 释放 to_release 列表中的所有信号量
+  //   │  └─ 获取等待该信号量的任务列表（waiters）
+  //   │  └─ 调度这些等待的任务（_schedule）
+  //   └─ 见 graph.hpp:838-845 (Node::_release_all)
+  //
+  // 实际使用示例：
+  //
+  //   示例 1：限制并发度（最多 2 个任务同时执行）
+  //   ┌─────────────────────────────────────────────────────────┐
+  //   │ tf::Executor executor(8);                               │
+  //   │ tf::Taskflow taskflow;                                  │
+  //   │ tf::Semaphore semaphore(2);  // 最多 2 个任务同时执行   │
+  //   │                                                         │
+  //   │ for(int i = 0; i < 10; i++) {                          │
+  //   │   taskflow.emplace([i](){                              │
+  //   │     std::cout << "Task " << i << std::endl;            │
+  //   │   }).acquire(semaphore).release(semaphore);            │
+  //   │ }                                                       │
+  //   │                                                         │
+  //   │ executor.run(taskflow).wait();                         │
+  //   └─────────────────────────────────────────────────────────┘
+  //   结果：虽然有 8 个工作线程，但最多只有 2 个任务同时执行
+  //
+  //   示例 2：互斥访问（临界区）
+  //   ┌─────────────────────────────────────────────────────────┐
+  //   │ tf::Semaphore mutex(1);  // 信号量值为 1，实现互斥      │
+  //   │ int counter = 0;                                        │
+  //   │                                                         │
+  //   │ for(int i = 0; i < 1000; i++) {                        │
+  //   │   taskflow.emplace([&counter](){                       │
+  //   │     counter++;  // 临界区，同一时间只有一个任务执行    │
+  //   │   }).acquire(mutex).release(mutex);                    │
+  //   │ }                                                       │
+  //   └─────────────────────────────────────────────────────────┘
+  //   结果：counter 的值正确为 1000，没有数据竞争
+  //
+  //   示例 3：资源池管理（数据库连接池）
+  //   ┌─────────────────────────────────────────────────────────┐
+  //   │ tf::Semaphore db_pool(5);  // 5 个数据库连接            │
+  //   │                                                         │
+  //   │ for(int i = 0; i < 100; i++) {                         │
+  //   │   taskflow.emplace([i](){                              │
+  //   │     // 访问数据库                                      │
+  //   │     query_database(i);                                 │
+  //   │   }).acquire(db_pool).release(db_pool);                │
+  //   │ }                                                       │
+  //   └─────────────────────────────────────────────────────────┘
+  //   结果：最多 5 个任务同时访问数据库，避免连接池耗尽
+  //
+  //   示例 4：跨 Taskflow 的并发控制
+  //   ┌─────────────────────────────────────────────────────────┐
+  //   │ tf::Semaphore global_limit(3);                         │
+  //   │ tf::Taskflow taskflow1, taskflow2;                     │
+  //   │                                                         │
+  //   │ taskflow1.emplace([](){...}).acquire(global_limit)     │
+  //   │                              .release(global_limit);   │
+  //   │ taskflow2.emplace([](){...}).acquire(global_limit)     │
+  //   │                              .release(global_limit);   │
+  //   │                                                         │
+  //   │ executor.run(taskflow1);                               │
+  //   │ executor.run(taskflow2);                               │
+  //   └─────────────────────────────────────────────────────────┘
+  //   结果：两个 Taskflow 共享同一个信号量，总并发度不超过 3
+  //
+  // 信号量的工作原理：
+  //
+  //   1. 初始状态：
+  //      Semaphore semaphore(2);  // _cur_value = 2, _max_value = 2
+  //
+  //   2. 任务 A 获取信号量：
+  //      _cur_value = 2 - 1 = 1  ✓ 成功，任务 A 执行
+  //
+  //   3. 任务 B 获取信号量：
+  //      _cur_value = 1 - 1 = 0  ✓ 成功，任务 B 执行
+  //
+  //   4. 任务 C 获取信号量：
+  //      _cur_value = 0  ✗ 失败，任务 C 进入等待队列
+  //
+  //   5. 任务 A 完成，释放信号量：
+  //      _cur_value = 0 + 1 = 1
+  //      唤醒等待队列中的任务 C，重新调度
+  //
+  //   6. 任务 C 被重新调度，获取信号量：
+  //      _cur_value = 1 - 1 = 0  ✓ 成功，任务 C 执行
+  //
+  // 注意事项：
+  //   - 信号量的生命周期必须长于使用它的任务
+  //   - 通常将信号量定义在 main 函数或全局作用域
+  //   - 任务可以只 acquire、只 release，或同时 acquire + release
+  //   - 多个任务可以共享同一个信号量
+  //   - 信号量是线程安全的（内部使用 mutex 保护）
   std::unique_ptr<Semaphores> _semaphores;
 
   // 异常指针，用于存储任务执行过程中捕获的异常
@@ -821,27 +996,118 @@ inline void Node::_rethrow_exception() {
 }
 
 // Function: _acquire_all
+//
+// 尝试获取任务所需的所有信号量
+//
+// 函数作用：
+//   在任务执行前，尝试获取 to_acquire 列表中的所有信号量
+//   如果无法获取所有信号量，回滚已获取的信号量，任务进入等待状态
+//
+// 参数：
+//   nodes - 输出参数，用于存储因信号量释放而被唤醒的任务
+//
+// 返回值：
+//   true  - 成功获取所有信号量，任务可以执行
+//   false - 无法获取所有信号量，任务进入等待队列
+//
+// 执行流程：
+//   1. 按顺序尝试获取每个信号量
+//   2. 如果某个信号量获取失败：
+//      a. 回滚已经获取的信号量（避免死锁）
+//      b. 当前任务被加入信号量的等待队列
+//      c. 返回 false
+//   3. 如果所有信号量都获取成功，返回 true
+//
+// 为什么需要回滚？
+//   避免死锁！假设有两个任务和两个信号量：
+//   - 任务 A 需要信号量 S1 和 S2
+//   - 任务 B 需要信号量 S2 和 S1
+//   如果不回滚：
+//     T1: 任务 A 获取 S1
+//     T2: 任务 B 获取 S2
+//     T3: 任务 A 尝试获取 S2（失败，等待）
+//     T4: 任务 B 尝试获取 S1（失败，等待）
+//     结果：死锁！
+//   使用回滚：
+//     T1: 任务 A 获取 S1
+//     T2: 任务 B 获取 S2
+//     T3: 任务 A 尝试获取 S2（失败）
+//     T4: 任务 A 释放 S1（回滚）
+//     T5: 任务 B 获取 S1，执行完毕，释放 S1 和 S2
+//     T6: 任务 A 被唤醒，获取 S1 和 S2，执行
+//     结果：避免死锁！
+//
+// 调用位置：
+//   executor.hpp:2057 (_invoke 函数的阶段 1.3)
 inline bool Node::_acquire_all(SmallVector<Node*>& nodes) {
   // assert(_semaphores != nullptr);
   auto& to_acquire = _semaphores->to_acquire;
+
+  // 按顺序尝试获取每个信号量
   for(size_t i = 0; i < to_acquire.size(); ++i) {
+    // 尝试获取第 i 个信号量
+    // _try_acquire_or_wait 的逻辑：
+    //   - 如果信号量可用（_cur_value > 0），减少计数，返回 true
+    //   - 如果信号量不可用（_cur_value == 0），将当前任务加入等待队列，返回 false
     if(!to_acquire[i]->_try_acquire_or_wait(this)) {
+      // 获取第 i 个信号量失败，需要回滚已经获取的信号量
+      // 回滚范围：[0, i-1]，即已经成功获取的信号量
       for(size_t j = 1; j <= i; ++j) {
+        // 释放第 (i-j) 个信号量
+        // 例如：i = 2 时，释放第 1 和第 0 个信号量
         to_acquire[i-j]->_release(nodes);
+        // nodes 会收集因释放信号量而被唤醒的任务
       }
+      // 返回 false，当前任务不执行，等待信号量可用
       return false;
     }
   }
+
+  // 所有信号量都成功获取，任务可以执行
   return true;
 }
 
 // Function: _release_all
+//
+// 释放任务持有的所有信号量
+//
+// 函数作用：
+//   在任务执行后，释放 to_release 列表中的所有信号量
+//   释放信号量会唤醒等待的任务，并将它们重新调度
+//
+// 参数：
+//   nodes - 输出参数，用于存储因信号量释放而被唤醒的任务
+//
+// 执行流程：
+//   1. 遍历 to_release 列表中的每个信号量
+//   2. 调用 Semaphore::_release(nodes)
+//      a. 增加信号量的计数（_cur_value++）
+//      b. 将等待队列中的任务移动到 nodes
+//   3. 调用者（_invoke）会调度 nodes 中的任务
+//
+// 为什么需要 nodes 参数？
+//   - 释放信号量可能唤醒多个等待的任务
+//   - 这些任务需要被重新调度到执行器
+//   - nodes 收集所有被唤醒的任务，统一调度
+//
+// 调用位置：
+//   executor.hpp:2268 (_invoke 函数的阶段 3)
 inline void Node::_release_all(SmallVector<Node*>& nodes) {
   // assert(_semaphores != nullptr);
   auto& to_release = _semaphores->to_release;
+
+  // 遍历所有需要释放的信号量
   for(const auto& sem : to_release) {
+    // 释放信号量
+    // Semaphore::_release 的逻辑：
+    //   1. 增加信号量的计数（_cur_value++）
+    //   2. 将等待队列（_waiters）中的任务移动到 nodes
+    //   3. 清空等待队列
     sem->_release(nodes);
+    // nodes 会收集所有被唤醒的任务
   }
+  // 调用者会调用 _schedule(worker, nodes.begin(), nodes.end())
+  // 将所有被唤醒的任务重新调度到执行器
 }
 
 
