@@ -10,35 +10,31 @@
 //     +---->| C |-----+
 //           +---+
 //
+#include <new>
 #include <taskflow/taskflow.hpp>  // the only include you need
 
-#include <new>
+int main() {
+    tf::Executor executor;
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    tf::Taskflow taskflow("simple");
 
-int main(){
+    auto [A, B, C, D] = taskflow.emplace([]() { std::cout << "TaskA\n"; }, []() { std::cout << "TaskB\n"; },
+                                         []() { std::cout << "TaskC\n"; }, []() { std::cout << "TaskD\n"; });
 
-  tf::Executor executor;
-  tf::Taskflow taskflow("simple");
+    A.name("A");
+    B.name("B");
+    C.name("C");
+    D.name("D");
 
-  auto [A, B, C, D] = taskflow.emplace(
-    []() { std::cout << "TaskA\n"; },
-    []() { std::cout << "TaskB\n"; },
-    []() { std::cout << "TaskC\n"; },
-    []() { std::cout << "TaskD\n"; }
-  );
+    A.precede(B, C);  // A runs before B and C
+    D.succeed(B, C);  // D runs after  B and C
 
-  A.name("A");
-  B.name("B");
-  C.name("C");
-  D.name("D");
+    std::cout << "开始执行" << std::endl;
+    executor.run(taskflow).wait();
+    std::cout << "执行完成" << std::endl;
 
-  A.precede(B, C);  // A runs before B and C
-  D.succeed(B, C);  // D runs after  B and C
+    // dump the taskflow graph into a .dot format
+    // taskflow.dump(std::cout);
 
-  executor.run(taskflow).wait();
-  
-  // dump the taskflow graph into a .dot format
-  taskflow.dump(std::cout);
-
-  return 0;
+    return 0;
 }
-
